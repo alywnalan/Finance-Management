@@ -11,7 +11,8 @@ from datetime import date, datetime
 from pathlib import Path
 from statistics import mean
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, session, Response
+from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
     import pytesseract
@@ -38,6 +39,7 @@ DB_PATH = Path(
 
 app = Flask(__name__, template_folder="../frontend/templates", static_folder="../frontend/static")
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+app.secret_key = os.environ.get("FINOVA_SECRET_KEY", "dev-secret-change-me")
 
 
 CATEGORIES = ["Food", "Travel", "Bills", "Shopping", "Entertainment", "Health", "Investments"]
@@ -84,61 +86,163 @@ def init_db() -> None:
     with db() as con:
         con.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password_hash TEXT,
+                name TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id INTEGER PRIMARY KEY,
+                risk_level TEXT DEFAULT 'Moderate',
+                horizon_years INTEGER DEFAULT 5,
+                emergency_fund_months INTEGER DEFAULT 3,
+                currency TEXT DEFAULT 'INR',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 amount REAL NOT NULL,
                 category TEXT NOT NULL,
                 payment_mode TEXT NOT NULL,
                 date TEXT NOT NULL,
                 notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
         )
+        # Migrations (SQLite supports these patterns)
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(transactions)").fetchall()}
+        if "user_id" not in cols:
+            con.execute("ALTER TABLE transactions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
+
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS months (
                 month TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             )
             """
         )
+        # Backfill/migrate months table if it existed without user_id
+        mcols = {r["name"] for r in con.execute("PRAGMA table_info(months)").fetchall()}
+        if "user_id" not in mcols:
+            con.execute("ALTER TABLE months ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
+
+        # Planner migration: old schema used id=1, new schema uses user_id PK.
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS planner (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                user_id INTEGER PRIMARY KEY,
                 income REAL DEFAULT 0,
                 savings_goal REAL DEFAULT 0,
-                budget REAL DEFAULT 0
+                budget REAL DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
         )
-        con.execute("INSERT OR IGNORE INTO planner (id) VALUES (1)")
-        ensure_month_row(con, date.today().strftime("%Y-%m"))
+        pcols = {r["name"] for r in con.execute("PRAGMA table_info(planner)").fetchall()}
+        if "user_id" not in pcols and "id" in pcols:
+            con.execute("ALTER TABLE planner RENAME TO planner_old")
+            con.execute(
+                """
+                CREATE TABLE planner (
+                    user_id INTEGER PRIMARY KEY,
+                    income REAL DEFAULT 0,
+                    savings_goal REAL DEFAULT 0,
+                    budget REAL DEFAULT 0,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            old = con.execute("SELECT income, savings_goal, budget FROM planner_old WHERE id = 1").fetchone()
+            if old:
+                con.execute(
+                    "INSERT OR IGNORE INTO planner (user_id, income, savings_goal, budget) VALUES (1, ?, ?, ?)",
+                    (float(old["income"] or 0), float(old["savings_goal"] or 0), float(old["budget"] or 0)),
+                )
+            con.execute("DROP TABLE planner_old")
+        # Ensure a default local user exists (for backwards compatible "no-login" usage)
+        con.execute(
+            "INSERT OR IGNORE INTO users (id, email, password_hash, name, created_at) VALUES (1, NULL, NULL, 'Local', ?)",
+            (datetime.utcnow().isoformat(),),
+        )
+        con.execute("INSERT OR IGNORE INTO planner (user_id) VALUES (1)")
+        con.execute(
+            "INSERT OR IGNORE INTO profiles (user_id, updated_at) VALUES (?, ?)",
+            (1, datetime.utcnow().isoformat()),
+        )
+        ensure_month_row(con, date.today().strftime("%Y-%m"), user_id=1)
 
 
-def ensure_month_row(con: sqlite3.Connection, month: str) -> None:
+def ensure_month_row(con: sqlite3.Connection, month: str, user_id: int) -> None:
     con.execute(
-        "INSERT OR IGNORE INTO months (month, created_at) VALUES (?, ?)",
-        (month, datetime.utcnow().isoformat()),
+        "INSERT OR IGNORE INTO months (month, user_id, created_at) VALUES (?, ?, ?)",
+        (month, user_id, datetime.utcnow().isoformat()),
     )
 
 
-def rows(month: str | None = None) -> list[dict]:
+def current_user_id() -> int:
+    """
+    Uses session auth when available, otherwise falls back to local user 1.
+    This keeps the existing single-user UI working while enabling real accounts.
+    """
+    uid = session.get("uid")
+    return int(uid) if uid else 1
+
+
+def current_profile(user_id: int) -> dict:
+    with db() as con:
+        row = con.execute(
+            "SELECT risk_level, horizon_years, emergency_fund_months, currency FROM profiles WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            con.execute(
+                "INSERT OR IGNORE INTO profiles (user_id, updated_at) VALUES (?, ?)",
+                (user_id, datetime.utcnow().isoformat()),
+            )
+            row = con.execute(
+                "SELECT risk_level, horizon_years, emergency_fund_months, currency FROM profiles WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    return dict(row) if row else {"risk_level": "Moderate", "horizon_years": 5, "emergency_fund_months": 3, "currency": "INR"}
+
+
+def rows(month: str | None = None, user_id: int | None = None) -> list[dict]:
+    user_id = int(user_id or current_user_id())
     with db() as con:
         if month:
             data = con.execute(
-                "SELECT * FROM transactions WHERE date LIKE ? ORDER BY date DESC, id DESC",
-                (f"{month}-%",),
+                "SELECT * FROM transactions WHERE user_id = ? AND date LIKE ? ORDER BY date DESC, id DESC",
+                (user_id, f"{month}-%"),
             ).fetchall()
         else:
-            data = con.execute("SELECT * FROM transactions ORDER BY date DESC, id DESC").fetchall()
+            data = con.execute(
+                "SELECT * FROM transactions WHERE user_id = ? ORDER BY date DESC, id DESC",
+                (user_id,),
+            ).fetchall()
     return [dict(r) for r in data]
 
 
-def planner() -> dict:
+def planner(user_id: int | None = None) -> dict:
+    user_id = int(user_id or current_user_id())
     with db() as con:
-        p = dict(con.execute("SELECT income, savings_goal, budget FROM planner WHERE id = 1").fetchone())
+        con.execute("INSERT OR IGNORE INTO planner (user_id) VALUES (?)", (user_id,))
+        p = dict(con.execute("SELECT income, savings_goal, budget FROM planner WHERE user_id = ?", (user_id,)).fetchone())
     return p
 
 
@@ -154,14 +258,15 @@ def amount_from_text(text: str) -> float:
     return float(match.group(1).replace(",", "")) if match else 0
 
 
-def add_tx(amount: float, category: str, payment_mode: str, tx_date: str, notes: str) -> dict:
+def add_tx(amount: float, category: str, payment_mode: str, tx_date: str, notes: str, user_id: int | None = None) -> dict:
+    user_id = int(user_id or current_user_id())
     with db() as con:
         month = str(tx_date)[:7]
         if re.match(r"^\d{4}-\d{2}$", month):
-            ensure_month_row(con, month)
+            ensure_month_row(con, month, user_id=user_id)
         cur = con.execute(
-            "INSERT INTO transactions (amount, category, payment_mode, date, notes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (amount, category, payment_mode, tx_date, notes, datetime.utcnow().isoformat()),
+            "INSERT INTO transactions (user_id, amount, category, payment_mode, date, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, amount, category, payment_mode, tx_date, notes, datetime.utcnow().isoformat()),
         )
         tx_id = cur.lastrowid
         row = con.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
@@ -216,7 +321,12 @@ def predict_month_end(transactions: list[dict], budget: float) -> dict:
     return {"prediction": round(prediction, 2), "overflow": overflow, "trend": trend}
 
 
-def investment_plan(investable: float, savings_goal: float) -> dict:
+def investment_plan(investable: float, savings_goal: float, profile: dict | None = None) -> dict:
+    profile = profile or {"risk_level": "Moderate", "horizon_years": 5, "emergency_fund_months": 3}
+    risk = (profile.get("risk_level") or "Moderate").lower()
+    horizon = int(profile.get("horizon_years") or 5)
+    ef_months = int(profile.get("emergency_fund_months") or 3)
+
     if investable <= 0:
         return {
             "investable": 0,
@@ -226,18 +336,37 @@ def investment_plan(investable: float, savings_goal: float) -> dict:
             "note": "Set income, budget, and savings goal first. The planner will suggest stocks only after your emergency/savings goal is protected.",
         }
 
-    if investable < 1000:
+    # More realistic: enforce emergency fund priority via profile, then risk/horizon tilt.
+    if ef_months >= 6 and investable < 3000:
+        allocation = [("Emergency buffer", 100)]
+        headline = "Emergency fund first"
+        note = "Your profile prioritizes a stronger emergency buffer. Keep this amount liquid until you hit your buffer target."
+    elif investable < 1000:
         allocation = [("Emergency buffer", 100)]
         headline = "Build cash buffer first"
         note = "The extra saving room is small, so keep it liquid instead of forcing a stock purchase."
     elif investable < 5000:
-        allocation = [("NIFTYBEES", 70), ("GOLDBEES", 30)]
-        headline = "Starter ETF split"
-        note = "A simple index-plus-gold split keeps risk controlled while you build consistency."
+        if risk in ("low", "conservative"):
+            allocation = [("GOLDBEES", 40), ("NIFTYBEES", 60)]
+            headline = "Conservative starter split"
+            note = "More defensive allocation to reduce volatility while you build the habit."
+        else:
+            allocation = [("NIFTYBEES", 75), ("GOLDBEES", 25)]
+            headline = "Starter ETF split"
+            note = "A simple index-plus-gold split keeps risk controlled while you build consistency."
     else:
-        allocation = [("NIFTYBEES", 45), ("JUNIORBEES", 20), ("HDFCBANK", 15), ("INFY", 10), ("GOLDBEES", 10)]
-        headline = "Balanced stock market basket"
-        note = "Use this as an educational basket idea, not live financial advice. Review risk before investing real money."
+        if risk in ("high", "aggressive") and horizon >= 7:
+            allocation = [("NIFTYBEES", 40), ("JUNIORBEES", 30), ("HDFCBANK", 15), ("INFY", 10), ("GOLDBEES", 5)]
+            headline = "Growth-tilted basket"
+            note = "Higher equity tilt for long horizons. Still educational—review risk before investing real money."
+        elif risk in ("low", "conservative"):
+            allocation = [("NIFTYBEES", 55), ("HDFCBANK", 15), ("INFY", 5), ("GOLDBEES", 25)]
+            headline = "Stability-tilted basket"
+            note = "More defensive tilt to reduce drawdowns. Educational mock data, not financial advice."
+        else:
+            allocation = [("NIFTYBEES", 45), ("JUNIORBEES", 20), ("HDFCBANK", 15), ("INFY", 10), ("GOLDBEES", 10)]
+            headline = "Balanced basket"
+            note = "Educational basket idea, not financial advice. Diversify and review risk before investing."
 
     return {
         "investable": round(investable, 2),
@@ -349,8 +478,9 @@ def insights(transactions: list[dict], p: dict) -> dict:
         if cat_avg and float(t["amount"]) > cat_avg * 2.2 and float(t["amount"]) > 2000:
             fraud.append(f"Rs. {int(t['amount']):,} in {t['category']} is unusually higher than your average.")
 
+    user_profile = current_profile(current_user_id())
     investable = max(0, projected_savings - savings_goal)
-    plan = investment_plan(investable, savings_goal)
+    plan = investment_plan(investable, savings_goal, profile=user_profile)
     stock_count = 5 if investable >= 5000 else (2 if investable >= 1000 else 0)
     quotes = live_quotes()
     quote_by_symbol = {q["symbol"]: q for q in quotes} if quotes else {}
@@ -369,6 +499,7 @@ def insights(transactions: list[dict], p: dict) -> dict:
         "stocks": [(quote_by_symbol.get(s["symbol"]) or s) for s in MOCK_STOCKS[:stock_count]],
         "market_ticker": [(quote_by_symbol.get(s["symbol"]) or s) for s in MOCK_STOCKS],
         "investment_plan": plan,
+        "profile": user_profile,
         "planner_summary": {
             "income": round(income, 2),
             "budget": round(budget, 2),
@@ -403,13 +534,18 @@ def answer_question(question: str, transactions: list[dict], p: dict) -> str:
 
 
 def months_index() -> list[dict]:
+    user_id = current_user_id()
     with db() as con:
-        ensure_month_row(con, date.today().strftime("%Y-%m"))
-        months = [r["month"] for r in con.execute("SELECT month FROM months ORDER BY month DESC").fetchall()]
+        ensure_month_row(con, date.today().strftime("%Y-%m"), user_id=user_id)
+        months = [
+            r["month"]
+            for r in con.execute("SELECT month FROM months WHERE user_id = ? ORDER BY month DESC", (user_id,)).fetchall()
+        ]
         totals = {
             r["month"]: {"month": r["month"], "total": round(float(r["total"] or 0), 2), "count": int(r["count"] or 0)}
             for r in con.execute(
-                "SELECT substr(date,1,7) AS month, SUM(amount) AS total, COUNT(*) AS count FROM transactions GROUP BY substr(date,1,7)"
+                "SELECT substr(date,1,7) AS month, SUM(amount) AS total, COUNT(*) AS count FROM transactions WHERE user_id = ? GROUP BY substr(date,1,7)",
+                (user_id,),
             ).fetchall()
         }
     out = []
@@ -419,8 +555,9 @@ def months_index() -> list[dict]:
 
 
 def state_payload(month: str | None = None) -> dict:
-    transactions = rows(month=month)
-    p = planner()
+    user_id = current_user_id()
+    transactions = rows(month=month, user_id=user_id)
+    p = planner(user_id=user_id)
     return {
         "transactions": transactions,
         "planner": p,
@@ -428,6 +565,7 @@ def state_payload(month: str | None = None) -> dict:
         "months": months_index(),
         "active_month": month,
         "current_month": date.today().strftime("%Y-%m"),
+        "me": {"user_id": user_id},
     }
 
 
@@ -476,6 +614,7 @@ def expense():
         data.get("payment_mode") or "UPI",
         data.get("date") or date.today().isoformat(),
         data.get("notes", ""),
+        user_id=current_user_id(),
     )
     return jsonify({"transaction": tx, "state": state_payload()})
 
@@ -487,21 +626,21 @@ def quick():
     category = classify(text)
     if amount <= 0:
         return jsonify({"error": "Please include an amount, for example: Swiggy 450"}), 400
-    tx = add_tx(amount, category, "UPI", date.today().isoformat(), text)
+    tx = add_tx(amount, category, "UPI", date.today().isoformat(), text, user_id=current_user_id())
     return jsonify({"transaction": tx, "category": category, "state": state_payload()})
 
 
 @app.delete("/api/expense/<int:tx_id>")
 def delete_expense(tx_id: int):
     with db() as con:
-        con.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+        con.execute("DELETE FROM transactions WHERE id = ? AND user_id = ?", (tx_id, current_user_id()))
     return jsonify(state_payload())
 
 
 @app.post("/api/clear")
 def clear_expenses():
     with db() as con:
-        con.execute("DELETE FROM transactions")
+        con.execute("DELETE FROM transactions WHERE user_id = ?", (current_user_id(),))
     return jsonify(state_payload())
 
 
@@ -509,9 +648,11 @@ def clear_expenses():
 def update_planner():
     data = request.get_json(force=True)
     with db() as con:
+        uid = current_user_id()
+        con.execute("INSERT OR IGNORE INTO planner (user_id) VALUES (?)", (uid,))
         con.execute(
-            "UPDATE planner SET income = ?, savings_goal = ?, budget = ? WHERE id = 1",
-            (float(data.get("income") or 0), float(data.get("savings_goal") or 0), float(data.get("budget") or 0)),
+            "UPDATE planner SET income = ?, savings_goal = ?, budget = ? WHERE user_id = ?",
+            (float(data.get("income") or 0), float(data.get("savings_goal") or 0), float(data.get("budget") or 0)), uid,
         )
     return jsonify(state_payload())
 
@@ -533,7 +674,7 @@ def scan():
     amount = amount_from_text(text) or 499
     category = classify(text)
     store = (text.strip().splitlines() or ["Scanned receipt"])[0][:70]
-    tx = add_tx(amount, category, "Card", date.today().isoformat(), f"Receipt: {store}")
+    tx = add_tx(amount, category, "Card", date.today().isoformat(), f"Receipt: {store}", user_id=current_user_id())
     preview = base64.b64encode(raw[:120000]).decode("utf-8")
     return jsonify({"transaction": tx, "ocr_text": text[:500], "preview": preview, "state": state_payload()})
 
@@ -541,13 +682,15 @@ def scan():
 @app.post("/api/chat")
 def chat():
     question = request.get_json(force=True).get("message", "")
-    return jsonify({"reply": answer_question(question, rows(), planner())})
+    uid = current_user_id()
+    return jsonify({"reply": answer_question(question, rows(user_id=uid), planner(user_id=uid))})
 
 
 @app.post("/api/report")
 def report():
-    transactions = rows()
-    p = planner()
+    uid = current_user_id()
+    transactions = rows(user_id=uid)
+    p = planner(user_id=uid)
     ai = insights(transactions, p)
     stock_lines = "\n- ".join(f"{s['symbol']} ({s['risk']} risk): {s['insight']}" for s in ai["stocks"]) or "No stock ideas yet. Protect your savings goal first."
     allocation_lines = "\n- ".join(
@@ -566,6 +709,138 @@ def report():
         "Educational investment ideas:\n- " + stock_lines
     )
     return jsonify({"report": report_text})
+
+
+@app.get("/api/me")
+def me():
+    uid = current_user_id()
+    with db() as con:
+        user = con.execute("SELECT id, email, name, created_at FROM users WHERE id = ?", (uid,)).fetchone()
+    return jsonify({"user": dict(user) if user else {"id": uid}, "profile": current_profile(uid)})
+
+
+@app.post("/api/auth/register")
+def auth_register():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    name = (data.get("name") or "").strip()
+    if not email or "@" not in email:
+        return jsonify({"error": "Please enter a valid email."}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+    with db() as con:
+        try:
+            cur = con.execute(
+                "INSERT INTO users (email, password_hash, name, created_at) VALUES (?, ?, ?, ?)",
+                (email, generate_password_hash(password), name, datetime.utcnow().isoformat()),
+            )
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "Email already registered. Please log in."}), 409
+        uid = int(cur.lastrowid)
+        con.execute("INSERT OR IGNORE INTO planner (user_id) VALUES (?)", (uid,))
+        con.execute(
+            "INSERT OR IGNORE INTO profiles (user_id, updated_at) VALUES (?, ?)",
+            (uid, datetime.utcnow().isoformat()),
+        )
+    session["uid"] = uid
+    return jsonify({"ok": True, "me": {"user_id": uid}})
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    with db() as con:
+        user = con.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,)).fetchone()
+    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid email or password."}), 401
+    session["uid"] = int(user["id"])
+    return jsonify({"ok": True, "me": {"user_id": int(user["id"])}})
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    session.pop("uid", None)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/profile")
+def profile_update():
+    uid = current_user_id()
+    data = request.get_json(force=True)
+    risk_level = (data.get("risk_level") or "Moderate").strip()
+    horizon_years = int(data.get("horizon_years") or 5)
+    emergency_fund_months = int(data.get("emergency_fund_months") or 3)
+    currency = (data.get("currency") or "INR").strip().upper()
+    if horizon_years < 1 or horizon_years > 50:
+        return jsonify({"error": "Horizon years must be between 1 and 50."}), 400
+    if emergency_fund_months < 0 or emergency_fund_months > 24:
+        return jsonify({"error": "Emergency fund months must be between 0 and 24."}), 400
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO profiles (user_id, risk_level, horizon_years, emergency_fund_months, currency, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              risk_level=excluded.risk_level,
+              horizon_years=excluded.horizon_years,
+              emergency_fund_months=excluded.emergency_fund_months,
+              currency=excluded.currency,
+              updated_at=excluded.updated_at
+            """,
+            (uid, risk_level, horizon_years, emergency_fund_months, currency, datetime.utcnow().isoformat()),
+        )
+    return jsonify({"ok": True, "profile": current_profile(uid)})
+
+
+@app.get("/api/export.csv")
+def export_csv():
+    uid = current_user_id()
+    txs = rows(user_id=uid)
+    # Simple CSV export (Excel-friendly)
+    def esc(v: object) -> str:
+        s = str(v if v is not None else "")
+        if any(c in s for c in [",", "\"", "\n", "\r"]):
+            s = "\"" + s.replace("\"", "\"\"") + "\""
+        return s
+
+    lines = ["id,date,amount,category,payment_mode,notes,created_at"]
+    for t in txs:
+        lines.append(
+            ",".join(
+                [
+                    esc(t.get("id")),
+                    esc(t.get("date")),
+                    esc(t.get("amount")),
+                    esc(t.get("category")),
+                    esc(t.get("payment_mode")),
+                    esc(t.get("notes")),
+                    esc(t.get("created_at")),
+                ]
+            )
+        )
+    csv_data = "\n".join(lines) + "\n"
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=finova-transactions.csv"},
+    )
+
+
+@app.get("/api/export.json")
+def export_json():
+    uid = current_user_id()
+    return jsonify(
+        {
+            "me": {"user_id": uid},
+            "profile": current_profile(uid),
+            "planner": planner(user_id=uid),
+            "transactions": rows(user_id=uid),
+            "exported_at": datetime.utcnow().isoformat() + "Z",
+        }
+    )
 
 
 

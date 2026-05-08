@@ -123,6 +123,16 @@
     <div class="app-grid grid grid-cols-[260px_1fr] gap-5">
       <aside class="glass sticky top-24 h-[calc(100vh-7rem)] rounded-3xl p-4">
         <div class="mb-5 px-2 text-xs uppercase tracking-[.25em] text-white/40">Workspace</div>
+        <div class="mb-4 rounded-2xl border border-white/10 bg-white/5 p-3">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-xs uppercase tracking-[.22em] text-white/40">Account</div>
+              <div id="meLine" class="mt-1 text-sm font-bold text-white/80">Local mode</div>
+            </div>
+            <button id="authBtn" class="ghost-btn rounded-2xl px-4 py-2 text-sm font-bold">Login</button>
+          </div>
+          <button id="profileBtn" class="ghost-btn mt-3 w-full rounded-2xl px-4 py-2 text-sm font-bold">Profile</button>
+        </div>
         <div class="mb-4 space-y-2 px-1">
           <label class="block text-xs uppercase tracking-[.22em] text-white/40">Month</label>
           <select id="monthSelect"></select>
@@ -134,6 +144,10 @@
         <a class="sidebar-link" href="#scanner">Scanner</a>
         <a class="sidebar-link" href="#assistant">Assistant</a>
         <button id="reportBtn" class="premium-btn mt-5 w-full rounded-2xl px-4 py-3 font-bold">Generate Report</button>
+        <div class="mt-3 grid grid-cols-2 gap-2">
+          <button id="exportCsvBtn" class="ghost-btn rounded-2xl px-4 py-2 text-sm font-bold">Export CSV</button>
+          <button id="exportJsonBtn" class="ghost-btn rounded-2xl px-4 py-2 text-sm font-bold">Export JSON</button>
+        </div>
       </aside>
 
       <section class="space-y-5">
@@ -266,6 +280,21 @@
       return data;
     }
 
+    async function refreshMe(){
+      try{
+        const data = await api('/api/me');
+        const u = data.user || {};
+        const line = u.email ? (u.name ? `${u.name} • ${u.email}` : u.email) : 'Local mode';
+        meLine.textContent = line;
+        authBtn.textContent = u.email ? 'Logout' : 'Login';
+        window.__profile = data.profile || null;
+      }catch(e){
+        meLine.textContent = 'Local mode';
+        authBtn.textContent = 'Login';
+        window.__profile = null;
+      }
+    }
+
     function pct(x){
       if(x === null || x === undefined || Number.isNaN(Number(x))) return '';
       const v = Number(x);
@@ -381,6 +410,71 @@
         toast('AI report generated');
       }catch(err){ toast(err.message || 'Report failed'); }
     };
+
+    exportCsvBtn.onclick=()=>{ window.location.href='/api/export.csv'; };
+    exportJsonBtn.onclick=async()=>{
+      try{
+        const data = await api('/api/export.json');
+        const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'finova-export.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast('Export ready');
+      }catch(err){ toast(err.message || 'Export failed'); }
+    };
+
+    authBtn.onclick=async()=>{
+      // If logged in -> logout; else basic prompt login/register
+      try{
+        const me = await api('/api/me');
+        if(me.user && me.user.email){
+          await api('/api/auth/logout', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+          await refreshMe();
+          await load();
+          toast('Logged out');
+          return;
+        }
+      }catch{}
+      const email = prompt('Email');
+      if(!email) return;
+      const password = prompt('Password (min 6 chars)');
+      if(!password) return;
+      try{
+        await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+        toast('Logged in');
+      }catch(e){
+        const name = prompt('No account found (or wrong password). Enter your name to register, or Cancel to stop.');
+        if(!name) throw e;
+        await api('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password,name})});
+        toast('Account created');
+      }
+      await refreshMe();
+      await load();
+    };
+
+    profileBtn.onclick=async()=>{
+      await refreshMe();
+      const p = window.__profile || {risk_level:'Moderate', horizon_years:5, emergency_fund_months:3, currency:'INR'};
+      const risk = prompt('Risk level (Conservative / Moderate / Aggressive)', p.risk_level || 'Moderate');
+      if(!risk) return;
+      const horizon = prompt('Horizon years (1-50)', String(p.horizon_years || 5));
+      if(!horizon) return;
+      const ef = prompt('Emergency fund months (0-24)', String(p.emergency_fund_months || 3));
+      if(!ef) return;
+      const cur = prompt('Currency (e.g. INR)', String(p.currency || 'INR'));
+      if(!cur) return;
+      try{
+        await api('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({risk_level:risk,horizon_years:Number(horizon),emergency_fund_months:Number(ef),currency:cur})});
+        toast('Profile saved');
+        await refreshMe();
+        await load();
+      }catch(err){ toast(err.message || 'Profile save failed'); }
+    };
     demoFill.onclick=async()=>{ quickText.value='Swiggy premium dinner 450'; quickBtn.click(); location.hash='dashboard'; };
     themeBtn.onclick=()=>document.body.classList.toggle('light');
 
@@ -409,7 +503,7 @@
     function resize(){ canvas.width=innerWidth; canvas.height=innerHeight; pts=Array.from({length:90},()=>({x:Math.random()*canvas.width,y:Math.random()*canvas.height,vx:(Math.random()-.5)*.45,vy:(Math.random()-.5)*.45})); }
     function draw(){ ctx.clearRect(0,0,canvas.width,canvas.height); pts.forEach((p,i)=>{p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>canvas.width)p.vx*=-1;if(p.y<0||p.y>canvas.height)p.vy*=-1;ctx.fillStyle='rgba(67,231,255,.6)';ctx.beginPath();ctx.arc(p.x,p.y,1.4,0,Math.PI*2);ctx.fill(); for(let j=i+1;j<pts.length;j++){const q=pts[j],d=Math.hypot(p.x-q.x,p.y-q.y); if(d<120){ctx.strokeStyle=`rgba(155,92,255,${1-d/120})`;ctx.lineWidth=.5;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.stroke();}}}); requestAnimationFrame(draw); }
     const trendChartEl=document.getElementById('trendChart'), donutChartEl=document.getElementById('donutChart'), heroChartEl=document.getElementById('heroChart');
-    resize(); draw(); addEventListener('resize', resize); load();
+    resize(); draw(); addEventListener('resize', resize); refreshMe(); load();
   </script>
 </body>
 </html>
